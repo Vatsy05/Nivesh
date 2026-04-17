@@ -1,12 +1,18 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import CalendarHeatmap from "react-calendar-heatmap";
-import "react-calendar-heatmap/dist/styles.css";
 import { ChevronDown, ChevronRight, Calendar } from "lucide-react";
 
 interface Props {
   transactions: any[];
+}
+
+interface MonthData {
+  key: string;
+  year: number;
+  month: number;
+  count: number;
+  amount: number;
 }
 
 export default function SIPHeatmap({ transactions }: Props) {
@@ -45,50 +51,78 @@ export default function SIPHeatmap({ transactions }: Props) {
 
 function FundHeatmap({ fundName, transactions }: { fundName: string; transactions: any[] }) {
   const [expanded, setExpanded] = useState(true);
+  const [hoveredCell, setHoveredCell] = useState<MonthData | null>(null);
 
-  // Build month data
-  const { monthData, startDate, endDate, sipMonths, totalMonths } = useMemo(() => {
+  // Build month grid data
+  const { monthGrid, sipMonths, totalMonths } = useMemo(() => {
     const map: Record<string, { count: number; amount: number }> = {};
     const dates = transactions
       .filter((t) => t.transaction_date)
       .map((t) => new Date(t.transaction_date))
       .sort((a, b) => a.getTime() - b.getTime());
 
-    if (dates.length === 0) return { monthData: [], startDate: new Date(), endDate: new Date(), sipMonths: 0, totalMonths: 0 };
+    if (dates.length === 0) return { monthGrid: [], sipMonths: 0, totalMonths: 0 };
 
     transactions.forEach((t) => {
       if (!t.transaction_date) return;
       const d = new Date(t.transaction_date);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+      const key = `${d.getFullYear()}-${d.getMonth()}`;
       if (!map[key]) map[key] = { count: 0, amount: 0 };
       map[key].count += 1;
       map[key].amount += parseFloat(t.amount_inr) || 0;
     });
 
-    const start = new Date(dates[0].getFullYear(), dates[0].getMonth(), 1);
-    const end = new Date();
-    const heatmapData = Object.entries(map).map(([date, data]) => ({
-      date,
-      count: data.count,
-      amount: data.amount,
-    }));
+    const startYear = dates[0].getFullYear();
+    const startMonth = dates[0].getMonth();
+    const now = new Date();
+    const endYear = now.getFullYear();
+    const endMonth = now.getMonth();
 
-    // Count months range
-    let total = 0;
-    const cur = new Date(start);
-    while (cur <= end) { total++; cur.setMonth(cur.getMonth() + 1); }
+    const grid: MonthData[] = [];
+    let y = startYear;
+    let m = startMonth;
+    while (y < endYear || (y === endYear && m <= endMonth)) {
+      const key = `${y}-${m}`;
+      const data = map[key];
+      grid.push({
+        key,
+        year: y,
+        month: m,
+        count: data?.count || 0,
+        amount: data?.amount || 0,
+      });
+      m++;
+      if (m > 11) { m = 0; y++; }
+    }
 
-    return { monthData: heatmapData, startDate: start, endDate: end, sipMonths: Object.keys(map).length, totalMonths: total };
+    return {
+      monthGrid: grid,
+      sipMonths: Object.keys(map).length,
+      totalMonths: grid.length,
+    };
   }, [transactions]);
 
   const consistency = totalMonths > 0 ? Math.round((sipMonths / totalMonths) * 100) : 0;
 
-  const getTooltip = (value: any) => {
-    if (!value || !value.date) return null;
-    const d = new Date(value.date);
-    const month = d.toLocaleDateString("en-IN", { month: "short", year: "numeric" });
-    return `${month}: ₹${value.amount?.toLocaleString("en-IN") || 0} (${value.count || 0} SIP${(value.count || 0) > 1 ? "s" : ""})`;
+  const monthLabels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  const getCellColor = (count: number) => {
+    if (count === 0) return "bg-slate-800/60";
+    if (count === 1) return "bg-emerald-800";
+    if (count === 2) return "bg-emerald-600";
+    if (count === 3) return "bg-emerald-500";
+    return "bg-emerald-400";
   };
+
+  // Group months into rows by year for a GitHub-style grid
+  const yearGroups = useMemo(() => {
+    const groups: Record<number, MonthData[]> = {};
+    monthGrid.forEach((m) => {
+      if (!groups[m.year]) groups[m.year] = [];
+      groups[m.year].push(m);
+    });
+    return Object.entries(groups).sort(([a], [b]) => parseInt(a) - parseInt(b));
+  }, [monthGrid]);
 
   return (
     <div className="glass-card overflow-hidden">
@@ -110,26 +144,48 @@ function FundHeatmap({ fundName, transactions }: { fundName: string; transaction
 
       {expanded && (
         <div className="px-6 pb-6 pt-2">
-          <div className="[&_.react-calendar-heatmap]:w-full [&_.react-calendar-heatmap_text]:fill-slate-500 [&_.react-calendar-heatmap_text]:text-[10px] [&_.color-empty]:fill-slate-800 [&_.color-scale-1]:fill-emerald-800 [&_.color-scale-2]:fill-emerald-600 [&_.color-scale-3]:fill-emerald-500 [&_.color-scale-4]:fill-emerald-400">
-            <CalendarHeatmap
-              startDate={startDate}
-              endDate={endDate}
-              values={monthData}
-              classForValue={(value: any) => {
-                if (!value || !value.count) return "color-empty";
-                if (value.count >= 4) return "color-scale-4";
-                if (value.count >= 3) return "color-scale-3";
-                if (value.count >= 2) return "color-scale-2";
-                return "color-scale-1";
-              }}
-              titleForValue={getTooltip}
-              showWeekdayLabels
-            />
+          <div className="overflow-x-auto">
+            <div className="inline-flex flex-col gap-1 min-w-fit">
+              {/* Month labels */}
+              <div className="flex items-center gap-1 ml-12 mb-1">
+                {monthLabels.map((label) => (
+                  <div key={label} className="w-7 text-center text-[10px] text-slate-600 select-none">{label}</div>
+                ))}
+              </div>
+              {/* Year rows */}
+              {yearGroups.map(([year, months]) => (
+                <div key={year} className="flex items-center gap-1">
+                  <span className="text-[10px] text-slate-600 w-10 text-right mr-1 select-none">{year}</span>
+                  {/* Fill empty months at start of year */}
+                  {months[0].month > 0 && Array.from({ length: months[0].month }).map((_, i) => (
+                    <div key={`empty-${i}`} className="w-7 h-7" />
+                  ))}
+                  {months.map((m) => (
+                    <div
+                      key={m.key}
+                      className={`w-7 h-7 rounded-md ${getCellColor(m.count)} heatmap-cell cursor-default relative`}
+                      onMouseEnter={() => setHoveredCell(m)}
+                      onMouseLeave={() => setHoveredCell(null)}
+                    >
+                      {hoveredCell?.key === m.key && m.count > 0 && (
+                        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 rounded-lg bg-slate-800 border border-white/10 shadow-xl text-xs whitespace-nowrap z-50 pointer-events-none animate-fade-in">
+                          <div className="text-slate-50 font-medium">{monthLabels[m.month]} {m.year}</div>
+                          <div className="text-emerald-400">₹{m.amount.toLocaleString("en-IN")} · {m.count} SIP{m.count > 1 ? "s" : ""}</div>
+                          <div className="absolute top-full left-1/2 -translate-x-1/2 -mt-px border-4 border-transparent border-t-slate-800" />
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
           </div>
           <div className="flex items-center gap-4 mt-4 pt-4 border-t border-white/5">
             <span className="text-xs text-slate-600">Legend:</span>
-            <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-sm bg-emerald-500" /><span className="text-xs text-slate-500">SIP recorded</span></div>
-            <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-sm bg-slate-800" /><span className="text-xs text-slate-500">No SIP</span></div>
+            <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-sm bg-slate-800/60" /><span className="text-xs text-slate-500">No SIP</span></div>
+            <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-sm bg-emerald-800" /><span className="text-xs text-slate-500">1 SIP</span></div>
+            <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-sm bg-emerald-600" /><span className="text-xs text-slate-500">2 SIPs</span></div>
+            <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-sm bg-emerald-400" /><span className="text-xs text-slate-500">3+ SIPs</span></div>
           </div>
         </div>
       )}
