@@ -7,8 +7,19 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
 
+
+def _get_database_url() -> str:
+    """Convert DATABASE_URL to use psycopg3 dialect."""
+    url = settings.DATABASE_URL
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
+
+
 engine = create_engine(
-    settings.DATABASE_URL,
+    _get_database_url(),
     echo=False,
     pool_size=10,
     max_overflow=20,
