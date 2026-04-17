@@ -9,12 +9,18 @@ from app.config import settings
 
 
 def _get_database_url() -> str:
-    """Convert DATABASE_URL to use psycopg3 dialect."""
+    """Convert DATABASE_URL to use psycopg3 dialect (falls back to psycopg2)."""
     url = settings.DATABASE_URL
+    # Determine which driver is available
+    try:
+        import psycopg  # noqa: F401
+        dialect = "postgresql+psycopg"
+    except ImportError:
+        dialect = "postgresql+psycopg2"
     if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+psycopg://", 1)
-    elif url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+        url = url.replace("postgres://", f"{dialect}://", 1)
+    elif url.startswith("postgresql://") and "+psycopg" not in url:
+        url = url.replace("postgresql://", f"{dialect}://", 1)
     return url
 
 
