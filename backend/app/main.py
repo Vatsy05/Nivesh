@@ -1,38 +1,33 @@
 """
-Nivesh FastAPI Application — internal service proxied by Next.js.
+Nivesh Flask Application — internal service proxied by Next.js.
 Handles PDF parsing, mfapi.in integration, and portfolio operations.
 """
 import logging
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from flask import Flask
+from flask_cors import CORS
 
-from app.routers import upload, portfolio
+from app.routers.upload import upload_bp
+from app.routers.portfolio import portfolio_bp
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 
-app = FastAPI(
-    title="Nivesh API",
-    description="Internal API for PDF parsing and portfolio management",
-    version="1.0.0",
-)
+app = Flask(__name__)
 
 # CORS — only Next.js server should call this, but allow localhost for dev
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+CORS(app, origins=["http://localhost:3000", "http://127.0.0.1:3000"])
 
-app.include_router(upload.router)
-app.include_router(portfolio.router)
+app.register_blueprint(upload_bp)
+app.register_blueprint(portfolio_bp)
 
 
 @app.get("/health")
-async def health():
-    return {"status": "healthy", "service": "Nivesh FastAPI"}
+def health():
+    return {"status": "healthy", "service": "Nivesh Flask"}
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=8000, debug=True)
