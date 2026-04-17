@@ -2,18 +2,24 @@
 CAM & CAS PDF Statement Parser for Indian Mutual Fund Statements.
 
 Handles:
-- CAM reports: issued by CAMS (Axis, HDFC, ICICI, Kotak, SBI, Mirae, etc.)
-- CAS reports: issued by NSDL/CDSL (consolidated across all AMCs)
+- CAMS + KFintech Consolidated Account Statements (CAS)
+- Multi-line transaction format where each transaction is 5-6 consecutive lines
 
-Uses pdfplumber as primary parser, PyMuPDF (fitz) as fallback.
-Multiple regex patterns per field for robustness.
+PDF layout per transaction block:
+  DD-Mon-YYYY
+  amount (e.g. 999.95 or (5,000.00))
+  nav/price
+  units (e.g. 13.194 or (154.609))
+  description text
+  unit_balance
+
+Uses PyMuPDF as primary parser, pdfplumber as fallback.
 """
 import re
 import io
 import logging
 from datetime import datetime, date
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
 
 import pdfplumber
 import fitz  # PyMuPDF
@@ -30,6 +36,7 @@ TRANSACTION_TYPE_MAP = {
     "systematic investment": "SIP",
     "systematic": "SIP",
     "systematic purchase": "SIP",
+    "purchase systematic": "SIP",
     "si": "SIP",
     "redemption": "redemption",
     "redeem": "redemption",
@@ -60,81 +67,77 @@ AMC_KEYWORDS = [
     "Motilal", "Parag Parikh", "PPFAS", "Edelweiss", "Sundaram",
     "Canara", "IDFC", "Bandhan", "Baroda", "HSBC", "Quant",
     "Invesco", "L&T", "Mahindra", "JM", "Quantum", "Union",
-    "Bank of India", "BOI", "LIC", "PGIM",
+    "Bank of India", "BOI", "LIC", "PGIM", "KFintech", "WhiteOak",
+    "NJ", "360 ONE", "ITI", "Navi",
 ]
 
-# ── Folio patterns ───────────────────────────────────────────────────────────
+# ── Regex helpers ─────────────────────────────────────────────────────────────
 
-FOLIO_PATTERNS = [
-    re.compile(r"Folio\s*(?:No|Number|#)?[\s:.]*([A-Za-z0-9/\-]+)", re.IGNORECASE),
-    re.compile(r"Folio:\s*([A-Za-z0-9/\-]+)", re.IGNORECASE),
-    re.compile(r"Folio\s+(\d[\d/\-]+\d)", re.IGNORECASE),
+DATE_RE = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{4}$")
+AMOUNT_RE = re.compile(r"^\(?[\d,]+\.\d{2,}\)?$")
+NUMBER_RE = re.compile(r"^\(?[\d,]+\.[\d]+\)?$")
+FOLIO_RE = re.compile(r"Folio\s*(?:No)?[:\s]*([A-Za-z0-9/\-]+)", re.IGNORECASE)
+FUND_SECTION_RE = re.compile(
+    r"^([A-Z][A-Za-z\s'&.()\-]+(?:Mutual Fund|MF|Aditya Birla|PPFAS|Quant|Tata|HDFC|ICICI|SBI|Axis|Kotak|Mirae|Nippon|DSP|UTI|Franklin|Motilal|Parag Parikh|Edelweiss|Sundaram|Canara|IDFC|Bandhan|Baroda|HSBC|Invesco|PGIM|LIC|BOI|WhiteOak|NJ|ITI|Navi)[A-Za-z\s'&.()\-]*)$"
+)
+
+# Lines to skip that are not real transactions
+SKIP_PATTERNS = [
+    re.compile(r"^\*\*\*", re.IGNORECASE),          # ***Address Updated...
+    re.compile(r"^\*\*\*NCT", re.IGNORECASE),
+    re.compile(r"^Opening Unit Balance", re.IGNORECASE),
+    re.compile(r"^Closing Unit Balance", re.IGNORECASE),
+    re.compile(r"^NAV on", re.IGNORECASE),
+    re.compile(r"^Market Value on", re.IGNORECASE),
+    re.compile(r"^Total Cost Value", re.IGNORECASE),
+    re.compile(r"^Page \d+ of \d+", re.IGNORECASE),
+    re.compile(r"^CAMSCASWS", re.IGNORECASE),
+    re.compile(r"^Consolidated Account Statement", re.IGNORECASE),
+    re.compile(r"^\d{2}-[A-Za-z]{3}-\d{4} To \d{2}-[A-Za-z]{3}-\d{4}$"),  # date range header
 ]
 
-# ── Transaction line patterns ────────────────────────────────────────────────
-
-TRANSACTION_PATTERNS = [
-    # Pattern 1 (CAMS): Date  Description  Amount  Units  NAV  [Balance]
-    re.compile(
-        r"(\d{1,2}[-/]\w{2,3}[-/]\d{2,4})\s+"
-        r"([\w\s\-/()]+?)\s+"
-        r"([\d,]+\.\d{2})\s+"
-        r"([\d,]+\.\d{2,6})\s+"
-        r"([\d,]+\.\d{2,4})"
-    ),
-    # Pattern 2 (CAS): Date  Transaction  Amount  Units  Price
-    re.compile(
-        r"(\d{1,2}[-/]\w{2,3}[-/]\d{2,4})\s+"
-        r"(.+?)\s+"
-        r"(?:₹|INR)?\s*([\d,]+\.?\d*)\s+"
-        r"(-?[\d,]+\.?\d*)\s+"
-        r"([\d,]+\.?\d*)"
-    ),
-    # Pattern 3 (Flexible): Date + numbers
-    re.compile(
-        r"(\d{1,2}[-/]\w{2,3}[-/]\d{2,4})"
-        r".*?"
-        r"(-?[\d,]+\.\d{2})\s+"
-        r"(-?[\d,]+\.\d{2,6})\s+"
-        r"([\d,]+\.\d{2,4})"
-    ),
-    # Pattern 4 (Minimal): Date DD/MM/YYYY + 3 numbers
-    re.compile(
-        r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\s+"
-        r".*?"
-        r"([\d,]+\.?\d+)\s+"
-        r"([\d,]+\.?\d+)\s+"
-        r"([\d,]+\.?\d+)"
-    ),
-]
+STAMP_DUTY_RE = re.compile(r"stamp duty", re.IGNORECASE)
+STT_RE = re.compile(r"STT Paid", re.IGNORECASE)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def _is_skip_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    for p in SKIP_PATTERNS:
+        if p.search(s):
+            return True
+    return False
 
-def parse_date(date_str: str) -> Optional[date]:
-    """Parse a date string trying multiple formats."""
-    date_str = date_str.strip()
-    for fmt in ["%d-%b-%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d-%b-%y", "%d/%m/%y"]:
+
+def _is_date(s: str) -> bool:
+    return bool(DATE_RE.match(s.strip()))
+
+
+def _is_amount(s: str) -> bool:
+    return bool(AMOUNT_RE.match(s.strip()))
+
+
+def _is_number(s: str) -> bool:
+    return bool(NUMBER_RE.match(s.strip()))
+
+
+def _parse_date(s: str) -> Optional[date]:
+    s = s.strip()
+    for fmt in ["%d-%b-%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d-%b-%y"]:
         try:
-            return datetime.strptime(date_str, fmt).date()
+            return datetime.strptime(s, fmt).date()
         except ValueError:
             continue
-    logger.warning(f"Could not parse date: '{date_str}'")
     return None
 
 
-def parse_amount(s: str) -> Optional[float]:
-    """Parse an amount string handling commas, currency symbols, and negative parens."""
+def _parse_amount(s: str) -> Optional[float]:
     if not s:
         return None
     s = s.strip()
-    neg = False
-    if s.startswith("(") and s.endswith(")"):
-        neg = True
-        s = s[1:-1]
-    if s.startswith("-"):
-        neg = True
-        s = s[1:]
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.strip("()")
     s = s.replace(",", "").replace("₹", "").replace("INR", "").strip()
     try:
         val = float(s)
@@ -143,306 +146,357 @@ def parse_amount(s: str) -> Optional[float]:
         return None
 
 
-def classify_transaction_type(text: str) -> str:
-    """Map raw transaction description to enum type."""
-    text_lower = text.strip().lower()
-    if text_lower in TRANSACTION_TYPE_MAP:
-        return TRANSACTION_TYPE_MAP[text_lower]
-    for key, val in TRANSACTION_TYPE_MAP.items():
-        if key in text_lower:
-            return val
+def _classify_type(text: str) -> str:
+    tl = text.lower()
+    if any(k in tl for k in ["redemption", "redeem", "repurchase"]):
+        return "redemption"
+    if any(k in tl for k in ["switch in", "switchin", "sw in"]):
+        return "switch_in"
+    if any(k in tl for k in ["switch out", "switchout", "sw out"]):
+        return "switch_out"
+    if any(k in tl for k in ["dividend payout"]):
+        return "dividend"
+    if any(k in tl for k in ["dividend reinvest", "div reinvest"]):
+        return "dividend_reinvest"
+    if any(k in tl for k in ["systematic", "sip", "purchase systematic", "purchase sip"]):
+        return "SIP"
+    if any(k in tl for k in ["purchase", "lumpsum", "additional"]):
+        return "lumpsum"
     return "lumpsum"
 
 
-# ── Parser Class ──────────────────────────────────────────────────────────────
+def _extract_fund_name(line: str) -> Optional[str]:
+    """Return fund name if line is a short top-level AMC section header.
+    We only match the short header like 'PPFAS Mutual Fund', not the
+    long scheme lines like '166ISDGG-quant Infrastructure Fund...').
+    """
+    s = line.strip()
+    # Must be a short line (AMC headers are short)
+    if len(s) < 4 or len(s) > 60:
+        return None
+    # Must NOT look like a scheme code line (starts with alphanumeric code)
+    if re.match(r'^[A-Z0-9]{4,}-', s):
+        return None
+    has_amc = any(a.lower() in s.lower() for a in AMC_KEYWORDS)
+    if not has_amc:
+        return None
+    fund_kw = ["fund", "mf"]
+    if any(k in s.lower() for k in fund_kw):
+        return s
+    return None
+
+
+# ── Core multi-line block parser ──────────────────────────────────────────────
+
+def _parse_blocks(lines: List[str], fund_name: str, folio: str, holder: str) -> List[Dict]:
+    """
+    Group consecutive lines into transaction blocks.
+
+    A real transaction block looks like:
+      [date]          e.g. 23-Apr-2024
+      [amount]        e.g. 999.95 or (5,000.00)
+      [nav]           e.g. 47.5941
+      [units]         e.g. 21.010 or (32.127)
+      [description]   e.g. Purchase SIP-BSE...
+      [unit_balance]  e.g. 507.067
+
+    Stamp Duty and STT Paid entries are 3-line blocks with tiny amounts — skipped.
+    """
+    transactions = []
+    seen = set()
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i].strip()
+
+        if not line or _is_skip_line(line):
+            i += 1
+            continue
+
+        # Must start with a date
+        if not _is_date(line):
+            i += 1
+            continue
+
+        txn_date_str = line
+        # Peek next lines
+        block = [txn_date_str]
+        j = i + 1
+        while j < n and len(block) < 8:
+            nl = lines[j].strip()
+            if not nl:
+                j += 1
+                continue
+            # If we hit another date, stop
+            if _is_date(nl) and len(block) > 2:
+                break
+            block.append(nl)
+            j += 1
+
+        # skip short blocks (stamp duty / STT: date + tiny amount + description)
+        if len(block) < 4:
+            i = j
+            continue
+
+        # Identify amount, nav, units, description from block[1:]
+        numbers = []
+        desc_parts = []
+        for item in block[1:]:
+            if (_is_amount(item) or _is_number(item)) and len(numbers) < 4:
+                numbers.append(item)
+            elif not _is_number(item):
+                desc_parts.append(item)
+
+        if len(numbers) < 3:
+            i = j
+            continue
+
+        parsed_date = _parse_date(txn_date_str)
+        if not parsed_date:
+            i = j
+            continue
+
+        # numbers order: amount, nav, units (, unit_balance optionally)
+        amount = _parse_amount(numbers[0])
+        nav = _parse_amount(numbers[1])
+        units = _parse_amount(numbers[2])
+        description = " ".join(desc_parts).strip()
+
+        # Skip stamp duty / STT lines (very small amounts, specific keywords)
+        if STAMP_DUTY_RE.search(description) or STT_RE.search(description):
+            i = j
+            continue
+
+        # Skip lines that are clearly non-transactions
+        if not amount or not units:
+            i = j
+            continue
+
+        key = f"{parsed_date}_{amount}_{units}"
+        if key in seen:
+            i = j
+            continue
+        seen.add(key)
+
+        transactions.append({
+            "transaction_date": parsed_date,
+            "transaction_type": _classify_type(description),
+            "amount_inr": amount,
+            "units": units,
+            "nav_at_transaction": nav,
+            "fund_name": fund_name or "Unknown Fund",
+            "folio_number": folio,
+            "account_holder_name": holder,
+        })
+
+        i = j
+
+    return transactions
+
+
+# ── Top-level extractor ───────────────────────────────────────────────────────
+
+def _parse_text(text: str, parser_name: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "transactions": [],
+        "fund_names": [],
+        "amc_names": [],
+        "account_holder_name": "",
+        "scheme_name_map": {},   # fund_name -> full scheme string from PDF
+        "parser_used": parser_name,
+        "errors": [],
+    }
+
+    if not text or len(text.strip()) < 50:
+        result["errors"].append("Extracted text too short — PDF may be an image or still locked")
+        return result
+
+    lines = text.split("\n")
+
+    # Extract account holder name (skip document title lines)
+    skip_names = {"consolidated account statement", "date", "transaction", "amount", "units", "price"}
+    for line in lines[:25]:
+        s = line.strip()
+        if s.lower() in skip_names:
+            continue
+        m = re.match(r'^([A-Z][a-z]+(?:\s+[A-Z][a-zA-Z]+){1,4})$', s)
+        if m and 5 < len(m.group(1)) < 60:
+            result["account_holder_name"] = m.group(1).strip()
+            break
+
+    # ── Build sections ────────────────────────────────────────────────────────
+    # A section = one AMC block. Within it we look for:
+    #   - scheme line: starts with code prefix like "PP001ZG-..."
+    #   - folio line
+    #   - transaction lines
+    SCHEME_LINE_RE = re.compile(r'^[A-Z0-9]{4,}-')
+    WATERMARK_RE = re.compile(r'CAMSCASWS|Version:|Live-\d', re.IGNORECASE)
+
+    sections: List[Tuple[str, str, str, List[str]]] = []  # (fund, folio, scheme_name, lines)
+    fund_names: set = set()
+    amc_names: set = set()
+
+    current_fund = "Unknown Fund"
+    current_folio = ""
+    current_scheme = ""
+    current_lines: List[str] = []
+
+    for line in lines:
+        s = line.strip()
+
+        # AMC-level fund header (short, e.g. "PPFAS Mutual Fund")
+        fn = _extract_fund_name(s)
+        if fn:
+            if current_lines:
+                sections.append((current_fund, current_folio, current_scheme, current_lines))
+            current_fund = fn
+            current_folio = ""
+            current_scheme = ""
+            current_lines = []
+            fund_names.add(fn)
+            for amc in AMC_KEYWORDS:
+                if amc.lower() in fn.lower():
+                    amc_names.add(amc)
+                    break
+            continue
+
+        # Scheme line (e.g. "PP001ZG-Parag Parikh Flexi Cap Fund - Direct Plan Growth...")
+        if SCHEME_LINE_RE.match(s) and len(s) > 10 and not WATERMARK_RE.search(s):
+            # Extract the human-readable part after the code prefix
+            scheme_human = re.sub(r'^[A-Z0-9]{4,}-', '', s)
+            # Strip ISIN and advisor suffixes
+            scheme_human = re.sub(r'\s*-\s*ISIN:.*$', '', scheme_human, flags=re.IGNORECASE)
+            scheme_human = re.sub(r'\(Advisor:.*?\)', '', scheme_human, flags=re.IGNORECASE)
+            scheme_human = re.sub(r'\(formerly.*?\)', '', scheme_human, flags=re.IGNORECASE)
+            scheme_human = re.sub(r'\(Non-Demat\)', '', scheme_human, flags=re.IGNORECASE)
+            current_scheme = scheme_human.strip(" -,")
+            current_lines.append(line)
+            continue
+
+        # Folio line
+        fm = FOLIO_RE.search(s)
+        if fm:
+            current_folio = fm.group(1).strip()
+
+        current_lines.append(line)
+
+    if current_lines:
+        sections.append((current_fund, current_folio, current_scheme, current_lines))
+
+    # ── Extract transactions from each section ───────────────────────────────
+    all_txns: List[Dict] = []
+    scheme_name_map: Dict[str, str] = {}
+
+    for fund, folio, scheme, sec_lines in sections:
+        txns = _parse_blocks(sec_lines, fund, folio, result["account_holder_name"])
+        all_txns.extend(txns)
+        if scheme and fund not in scheme_name_map:
+            scheme_name_map[fund] = scheme
+
+    result["transactions"] = all_txns
+    result["fund_names"] = list(fund_names)
+    result["amc_names"] = list(amc_names)
+    result["scheme_name_map"] = scheme_name_map
+
+    logger.info(
+        f"[{parser_name}] Parsed {len(all_txns)} transactions across "
+        f"{len(fund_names)} funds from {len(sections)} sections"
+    )
+    return result
+
+
+# ── PDF text extractors ───────────────────────────────────────────────────────
+
+def _extract_text_pymupdf(pdf_bytes: bytes, password: str = "") -> Tuple[str, List[str]]:
+    errors: List[str] = []
+    pages = []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if doc.needs_pass:
+            if not password:
+                errors.append("PyMuPDF: PDF is password-protected — no password provided")
+                doc.close()
+                return "", errors
+            success = doc.authenticate(password)
+            if not success:
+                errors.append("PyMuPDF: Incorrect PDF password")
+                doc.close()
+                return "", errors
+            logger.info("PyMuPDF: PDF unlocked successfully")
+        for i in range(len(doc)):
+            try:
+                pages.append(doc[i].get_text("text"))
+            except Exception as e:
+                errors.append(f"PyMuPDF page {i+1}: {e}")
+        doc.close()
+    except Exception as e:
+        errors.append(f"PyMuPDF open failed: {e}")
+    return "\n".join(pages), errors
+
+
+def _extract_text_pdfplumber(pdf_bytes: bytes, password: str = "") -> Tuple[str, List[str]]:
+    errors: List[str] = []
+    pages = []
+    try:
+        open_kwargs = {"password": password} if password else {}
+        with pdfplumber.open(io.BytesIO(pdf_bytes), **open_kwargs) as pdf:
+            for i, page in enumerate(pdf.pages):
+                try:
+                    text = page.extract_text()
+                    if text:
+                        pages.append(text)
+                    else:
+                        tables = page.extract_tables()
+                        for table in tables:
+                            for row in table:
+                                if row:
+                                    pages.append("  ".join(str(c) for c in row if c))
+                except Exception as e:
+                    errors.append(f"pdfplumber page {i+1}: {e}")
+    except Exception as e:
+        err_str = str(e).lower()
+        if any(k in err_str for k in ("password", "encrypted", "decrypt")):
+            errors.append(f"pdfplumber: Wrong or missing PDF password — {e}")
+        else:
+            errors.append(f"pdfplumber open failed: {e}")
+    return "\n".join(pages), errors
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 class CamCasParser:
     """
-    Dual-mode parser for CAM and CAS mutual fund PDF statements.
-    Tries pdfplumber first; if < 3 transactions extracted, retries with PyMuPDF.
+    Multi-line block parser for CAMS/KFintech Consolidated Account Statements.
+    Tries PyMuPDF first; falls back to pdfplumber.
     """
 
     def __init__(self):
         self.errors: List[str] = []
 
-    def parse(self, pdf_bytes: bytes) -> Dict[str, Any]:
-        """
-        Parse a PDF and return extracted transactions + metadata.
-        
-        Returns:
-            {
-                "transactions": [list of dicts],
-                "fund_names": [unique fund names],
-                "amc_names": [unique AMC names],
-                "account_holder_name": str,
-                "parser_used": str,
-                "errors": [error messages]
-            }
-        """
+    def parse(self, pdf_bytes: bytes, password: str = "") -> Dict[str, Any]:
         self.errors = []
 
-        # Attempt 1: pdfplumber
-        logger.info("Parsing with pdfplumber...")
-        text = self._extract_text_pdfplumber(pdf_bytes)
-        result = self._parse_transactions(text, "pdfplumber")
+        # Primary: PyMuPDF
+        logger.info("Parsing with PyMuPDF...")
+        text, errs = _extract_text_pymupdf(pdf_bytes, password)
+        self.errors.extend(errs)
+        result = _parse_text(text, "PyMuPDF")
 
-        # Fallback: if < 3 transactions, retry with PyMuPDF
+        # Fallback: pdfplumber
         if len(result["transactions"]) < 3:
-            logger.info(f"pdfplumber got {len(result['transactions'])} txns, retrying with PyMuPDF...")
-            text2 = self._extract_text_pymupdf(pdf_bytes)
-            result2 = self._parse_transactions(text2, "PyMuPDF")
+            logger.info(f"PyMuPDF got {len(result['transactions'])} txns, retrying with pdfplumber...")
+            text2, errs2 = _extract_text_pdfplumber(pdf_bytes, password)
+            self.errors.extend(errs2)
+            result2 = _parse_text(text2, "pdfplumber")
             if len(result2["transactions"]) > len(result["transactions"]):
-                logger.info(f"PyMuPDF got {len(result2['transactions'])} txns, using PyMuPDF")
+                logger.info(f"pdfplumber got {len(result2['transactions'])} txns, using pdfplumber")
                 result = result2
 
-        result["errors"] = self.errors
+        result["errors"].extend(self.errors)
         return result
 
-    def _extract_text_pdfplumber(self, pdf_bytes: bytes) -> str:
-        pages = []
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                for i, page in enumerate(pdf.pages):
-                    try:
-                        text = page.extract_text()
-                        if text:
-                            pages.append(text)
-                        else:
-                            tables = page.extract_tables()
-                            for table in tables:
-                                for row in table:
-                                    if row:
-                                        pages.append("  ".join(str(c) for c in row if c))
-                    except Exception as e:
-                        self.errors.append(f"pdfplumber page {i+1}: {e}")
-        except Exception as e:
-            self.errors.append(f"pdfplumber open failed: {e}")
-        return "\n".join(pages)
 
-    def _extract_text_pymupdf(self, pdf_bytes: bytes) -> str:
-        pages = []
-        try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            for i in range(len(doc)):
-                try:
-                    pages.append(doc[i].get_text("text"))
-                except Exception as e:
-                    self.errors.append(f"PyMuPDF page {i+1}: {e}")
-            doc.close()
-        except Exception as e:
-            self.errors.append(f"PyMuPDF open failed: {e}")
-        return "\n".join(pages)
-
-    def _detect_format(self, text: str) -> str:
-        """Detect if this is a CAS or CAM format statement."""
-        cas_indicators = ["consolidated account statement", "nsdl", "cdsl", "depository", "cas"]
-        return "CAS" if any(kw in text[:5000].lower() for kw in cas_indicators) else "CAM"
-
-    def _parse_transactions(self, text: str, parser_name: str) -> Dict[str, Any]:
-        result = {
-            "transactions": [],
-            "fund_names": [],
-            "amc_names": [],
-            "account_holder_name": "",
-            "parser_used": parser_name,
-        }
-
-        if not text or len(text.strip()) < 50:
-            self.errors.append("Extracted text too short")
-            return result
-
-        result["account_holder_name"] = self._extract_account_holder(text)
-        doc_format = self._detect_format(text)
-        logger.info(f"Document format: {doc_format}")
-
-        # Split into fund/folio sections
-        sections = self._split_into_sections(text)
-        if not sections:
-            sections = [("Unknown Fund", "", text)]
-
-        fund_names = set()
-        amc_names = set()
-
-        for fund_name, folio, section_text in sections:
-            txns = self._extract_from_section(section_text, fund_name, folio, result["account_holder_name"])
-            result["transactions"].extend(txns)
-            if fund_name and fund_name != "Unknown Fund":
-                fund_names.add(fund_name)
-                for amc in AMC_KEYWORDS:
-                    if amc.lower() in fund_name.lower():
-                        amc_names.add(amc)
-                        break
-
-        result["fund_names"] = list(fund_names)
-        result["amc_names"] = list(amc_names)
-        logger.info(f"Parsed {len(result['transactions'])} transactions, {len(fund_names)} funds, {len(amc_names)} AMCs")
-        return result
-
-    def _extract_account_holder(self, text: str) -> str:
-        patterns = [
-            re.compile(r"(?:Name|Account\s*Holder|Investor)\s*:?\s*([A-Z][A-Za-z\s.]+?)(?:\n|Email|PAN|Address|Mobile)", re.IGNORECASE),
-            re.compile(r"Dear\s+([A-Z][A-Za-z\s.]+?)(?:\n|,)", re.IGNORECASE),
-            re.compile(r"(?:Mr|Mrs|Ms)\.?\s+([A-Z][A-Za-z\s]+)", re.IGNORECASE),
-        ]
-        for p in patterns:
-            m = p.search(text[:2000])
-            if m:
-                name = m.group(1).strip().rstrip(",.:;")
-                if 3 < len(name) < 80:
-                    return name
-        return ""
-
-    def _split_into_sections(self, text: str) -> List[Tuple[str, str, str]]:
-        sections = []
-        lines = text.split("\n")
-        current_fund = ""
-        current_folio = ""
-        current_lines: List[str] = []
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                current_lines.append(line)
-                continue
-
-            # Check for folio
-            folio_match = None
-            for p in FOLIO_PATTERNS:
-                folio_match = p.search(stripped)
-                if folio_match:
-                    break
-
-            if folio_match:
-                if current_fund and current_lines:
-                    sections.append((current_fund, current_folio, "\n".join(current_lines)))
-                current_folio = folio_match.group(1).strip()
-                current_lines = [line]
-                fund = self._find_fund_name(stripped, lines, lines.index(line) if line in lines else 0)
-                if fund:
-                    current_fund = fund
-                continue
-
-            # Check for fund name
-            fund = self._match_fund_name(stripped)
-            if fund and not self._is_transaction_line(stripped):
-                if current_fund and current_lines:
-                    sections.append((current_fund, current_folio, "\n".join(current_lines)))
-                current_fund = fund
-                current_lines = [line]
-                continue
-
-            current_lines.append(line)
-
-        if current_fund and current_lines:
-            sections.append((current_fund, current_folio, "\n".join(current_lines)))
-
-        return sections
-
-    def _find_fund_name(self, folio_line: str, all_lines: List[str], idx: int) -> str:
-        for i in range(max(0, idx - 3), min(len(all_lines), idx + 2)):
-            fund = self._match_fund_name(all_lines[i].strip())
-            if fund:
-                return fund
-        return ""
-
-    def _match_fund_name(self, text: str) -> str:
-        if len(text) < 10 or len(text) > 200:
-            return ""
-        has_amc = any(a.lower() in text.lower() for a in AMC_KEYWORDS)
-        if not has_amc:
-            return ""
-        fund_kw = ["fund", "plan", "scheme", "growth", "dividend", "direct", "regular",
-                    "idcw", "option", "flexi", "cap", "equity", "debt", "hybrid", "liquid"]
-        if any(k in text.lower() for k in fund_kw):
-            name = re.sub(r"\s+\d{1,2}[-/]\w{2,3}[-/]\d{2,4}.*$", "", text)
-            name = re.sub(r"\s+Folio.*$", "", name, flags=re.IGNORECASE)
-            name = name.strip()
-            if len(name) > 10:
-                return name
-        return ""
-
-    def _is_transaction_line(self, line: str) -> bool:
-        return bool(re.match(r"^\s*\d{1,2}[-/]\w{2,3}[-/]\d{2,4}", line))
-
-    def _extract_from_section(self, text: str, fund_name: str, folio: str, holder: str) -> List[Dict]:
-        transactions = []
-        seen = set()
-
-        for line in text.split("\n"):
-            stripped = line.strip()
-            if not stripped or len(stripped) < 15:
-                continue
-            if any(k in stripped.lower() for k in ["date", "description", "amount", "nav", "balance", "---"]):
-                if stripped.lower().startswith("date"):
-                    continue
-
-            txn = self._try_parse_line(stripped)
-            if txn and txn.get("transaction_date"):
-                key = f"{txn['transaction_date']}_{txn.get('amount_inr')}_{txn.get('units')}"
-                if key not in seen:
-                    txn["fund_name"] = fund_name or "Unknown Fund"
-                    txn["folio_number"] = folio
-                    txn["account_holder_name"] = holder
-                    transactions.append(txn)
-                    seen.add(key)
-
-        return transactions
-
-    def _try_parse_line(self, line: str) -> Optional[Dict]:
-        for i, pattern in enumerate(TRANSACTION_PATTERNS):
-            m = pattern.search(line)
-            if m:
-                try:
-                    return self._build_txn(m, i, line)
-                except Exception as e:
-                    logger.debug(f"Pattern {i} failed: {e}")
-        return None
-
-    def _build_txn(self, m: re.Match, idx: int, line: str) -> Optional[Dict]:
-        g = m.groups()
-        txn: Dict[str, Any] = {}
-
-        if idx == 0:  # CAMS format
-            txn["transaction_date"] = parse_date(g[0])
-            txn["transaction_type"] = classify_transaction_type(g[1])
-            txn["amount_inr"] = parse_amount(g[2])
-            txn["units"] = parse_amount(g[3])
-            txn["nav_at_transaction"] = parse_amount(g[4])
-        elif idx == 1:  # CAS format
-            txn["transaction_date"] = parse_date(g[0])
-            txn["transaction_type"] = classify_transaction_type(g[1])
-            txn["amount_inr"] = parse_amount(g[2])
-            txn["units"] = parse_amount(g[3])
-            txn["nav_at_transaction"] = parse_amount(g[4])
-        elif idx == 2:  # Flexible
-            txn["transaction_date"] = parse_date(g[0])
-            txn["amount_inr"] = parse_amount(g[1])
-            txn["units"] = parse_amount(g[2])
-            txn["nav_at_transaction"] = parse_amount(g[3])
-            txn["transaction_type"] = self._type_from_text(line)
-        elif idx == 3:  # Minimal
-            txn["transaction_date"] = parse_date(g[0])
-            nums = sorted([abs(parse_amount(x) or 0) for x in g[1:4]])
-            if len(nums) == 3:
-                txn["nav_at_transaction"] = nums[0]
-                txn["units"] = nums[1]
-                txn["amount_inr"] = nums[2]
-            txn["transaction_type"] = self._type_from_text(line)
-
-        if not txn.get("transaction_date"):
-            return None
-        if txn.get("amount_inr") is None and txn.get("units") is None:
-            return None
-        return txn
-
-    def _type_from_text(self, text: str) -> str:
-        tl = text.lower()
-        for k, v in TRANSACTION_TYPE_MAP.items():
-            if k in tl:
-                return v
-        return "lumpsum"
-
-
-def parse_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
+def parse_pdf(pdf_bytes: bytes, password: str = "") -> Dict[str, Any]:
     """Main entry point: parse a mutual fund PDF statement."""
-    return CamCasParser().parse(pdf_bytes)
+    return CamCasParser().parse(pdf_bytes, password=password)

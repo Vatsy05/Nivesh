@@ -9,10 +9,10 @@ load_dotenv()
 
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/nivesh_db"
-    SUPABASE_URL: str = ""
-    SUPABASE_SERVICE_KEY: str = ""
-    ENCRYPTION_KEY: str = "change_me_to_a_base64_encoded_32_byte_key"
+    DATABASE_URL: str
+    SUPABASE_URL: str
+    SUPABASE_SERVICE_KEY: str
+    ENCRYPTION_KEY: str
 
     class Config:
         env_file = ".env"

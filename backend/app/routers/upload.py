@@ -5,7 +5,7 @@ import uuid
 import logging
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Header
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Header
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -31,6 +31,7 @@ def _get_user_id(x_user_id: str = Header(...)) -> str:
 @router.post("/upload", response_model=UploadResponse)
 async def upload_pdf(
     file: UploadFile = File(...),
+    password: str = Form(default=""),
     user_id: str = Depends(_get_user_id),
     db: Session = Depends(get_db),
 ):
@@ -71,6 +72,19 @@ async def upload_pdf(
     except Exception as e:
         logger.error(f"Encryption/upload failed: {e}")
 
+    # ── Clear previous records for this user (prevent duplicates) ─────────
+    try:
+        existing_docs = db.query(UploadedDocument).filter(
+            UploadedDocument.user_id == user_id
+        ).all()
+        for doc in existing_docs:
+            db.query(Portfolio).filter(Portfolio.document_id == doc.id).delete()
+            db.delete(doc)
+        db.flush()
+        logger.info(f"Cleared {len(existing_docs)} previous document(s) for user {user_id}")
+    except Exception as e:
+        logger.warning(f"Could not clear previous records: {e}")
+
     # ── Create document record ────────────────────────────────────────────
     document = UploadedDocument(
         id=doc_id,
@@ -87,7 +101,7 @@ async def upload_pdf(
     transactions_data = []
 
     try:
-        result = parse_pdf(pdf_bytes)
+        result = parse_pdf(pdf_bytes, password=password)
 
         if not result["transactions"]:
             parse_status = "failed"
@@ -101,10 +115,12 @@ async def upload_pdf(
 
         # ── Match fund names via mfapi.in ─────────────────────────────────
         scheme_map = {}
+        scheme_name_map = result.get("scheme_name_map", {})
         for fund_name in result.get("fund_names", []):
             if fund_name not in scheme_map:
                 try:
-                    code = await match_scheme_code(fund_name)
+                    scheme_name = scheme_name_map.get(fund_name, "")
+                    code = await match_scheme_code(fund_name, scheme_name=scheme_name)
                     scheme_map[fund_name] = code
                 except Exception as e:
                     logger.error(f"mfapi.in match failed for '{fund_name}': {e}")

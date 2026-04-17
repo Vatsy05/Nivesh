@@ -25,3 +25,6 @@ frontend/dist/
 
 # Uploads
 uploads/
+
+# Debug Output
+backend/debug_output/
