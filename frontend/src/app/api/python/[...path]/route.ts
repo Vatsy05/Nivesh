@@ -43,16 +43,34 @@ async function proxyToFastAPI(
     }
   }
 
+  // Slow routes: PDF parsing + fund matching, or NAV history fetching.
+  // upload: fund matching can take max(60, n_funds * 3) seconds — 180 s gives
+  // ample headroom even for large CAS statements with 40+ funds.
+  const slowRoutes = ["upload", "holdings/history", "holdings/rebuild"];
+  const isSlowRoute = slowRoutes.includes(path);
+  const timeoutMs = path === "upload" ? 180_000 : isSlowRoute ? 90_000 : 15_000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     const response = await fetch(url, {
       method: req.method,
       headers,
       body,
+      signal: controller.signal,
     });
 
     const data = await response.json();
+    clearTimeout(timeoutId);
     return NextResponse.json(data, { status: response.status });
-  } catch (error) {
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    if (error.name === "AbortError") {
+      const hint = path === "upload"
+        ? "PDF parsing timed out — try a smaller file"
+        : "Request timed out — the server is taking too long";
+      return NextResponse.json({ error: hint }, { status: 504 });
+    }
     console.error(`Proxy error to ${url}:`, error);
     return NextResponse.json(
       { error: "Failed to connect to internal API" },

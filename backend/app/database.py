@@ -30,6 +30,11 @@ engine = create_engine(
     pool_size=10,
     max_overflow=20,
     pool_pre_ping=True,
+    # Disable psycopg3 prepared statement caching.
+    # Supabase uses PgBouncer in transaction mode which doesn't support
+    # server-side prepared statements across connections — this causes
+    # "DuplicatePreparedStatement" errors under concurrent load.
+    connect_args={"prepare_threshold": None},
 )
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)

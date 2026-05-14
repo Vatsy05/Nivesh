@@ -7,7 +7,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import upload, portfolio
+from app.routers import upload, portfolio, analytics, holdings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,7 +17,7 @@ logging.basicConfig(
 app = FastAPI(
     title="Nivesh API",
     description="Internal API for PDF parsing and portfolio management",
-    version="1.0.0",
+    version="3.0.0",
 )
 
 # CORS — only Next.js server should call this, but allow localhost for dev
@@ -31,6 +31,8 @@ app.add_middleware(
 
 app.include_router(upload.router)
 app.include_router(portfolio.router)
+app.include_router(analytics.router)
+app.include_router(holdings.router)
 
 
 @app.get("/health")

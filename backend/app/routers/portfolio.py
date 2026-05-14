@@ -1,6 +1,7 @@
 """
 Portfolio router — CRUD + NAV refresh with 4-hour caching.
 """
+import asyncio
 import uuid
 import logging
 from datetime import datetime, timedelta
@@ -171,68 +172,87 @@ async def delete_transaction(
     return {"message": "Transaction deleted"}
 
 
+@router.delete("/portfolio/all/clear")
+async def clear_all_portfolio_data(
+    user_id: str = Depends(_get_user_id),
+    db: Session = Depends(get_db),
+):
+    """
+    Wipe ALL portfolio transactions and documents for this user.
+    Use before re-uploading to guarantee a clean slate.
+    """
+    deleted = db.query(Portfolio).filter(Portfolio.user_id == user_id).delete(synchronize_session="fetch")
+    db.query(UploadedDocument).filter(UploadedDocument.user_id == user_id).delete(synchronize_session="fetch")
+    db.commit()
+    logger.info(f"Cleared all data for user {user_id}: {deleted} portfolio rows deleted")
+    return {"message": f"Cleared {deleted} transactions. Upload your PDF again to start fresh."}
+
+
+
 async def _refresh_units(db: Session, user_id: str) -> None:
     """
-    For each unique scheme_code:
-    1. Check nav_cache — skip if refreshed < 4 hours ago
-    2. Fetch latest NAV from mfapi.in and update cache
-    3. Calculate net units (purchases - redemptions)
-    4. Update current_units on all portfolio rows
+    Refresh the latest NAV cache for every scheme the user holds.
+
+    IMPORTANT: This function used to also overwrite `current_units` with
+    (purchases - redemptions), which is wrong for any fund whose user-held
+    units come from before the statement window (Opening Unit Balance).
+    The PDF's Closing Unit Balance is now stamped onto each row at upload
+    time and is authoritative — we no longer recompute or overwrite it here.
+
+    NAV cache refresh runs concurrently across all scheme codes so the
+    /portfolio endpoint doesn't block the event loop for >15s and hit the
+    proxy timeout.
     """
-    scheme_codes = (
-        db.query(Portfolio.scheme_code)
-        .filter(Portfolio.user_id == user_id, Portfolio.scheme_code.isnot(None))
-        .distinct()
-        .all()
-    )
+    scheme_codes = [
+        sc for (sc,) in (
+            db.query(Portfolio.scheme_code)
+            .filter(Portfolio.user_id == user_id, Portfolio.scheme_code.isnot(None))
+            .distinct()
+            .all()
+        )
+        if sc
+    ]
+    if not scheme_codes:
+        return
 
-    purchase_types = {"SIP", "lumpsum", "switch_in"}
-    redemption_types = {"redemption", "switch_out"}
+    # Decide which scheme codes need a fresh NAV (cache miss or > CACHE_HOURS)
+    now = datetime.utcnow()
+    cached_map = {
+        c.scheme_code: c
+        for c in db.query(NavCache).filter(NavCache.scheme_code.in_(scheme_codes)).all()
+    }
+    stale: list[str] = []
+    for sc in scheme_codes:
+        cached = cached_map.get(sc)
+        if not cached or not cached.last_refreshed or (now - cached.last_refreshed) >= timedelta(hours=CACHE_HOURS):
+            stale.append(sc)
 
-    for (scheme_code,) in scheme_codes:
-        # Check cache
-        cached = db.query(NavCache).filter(NavCache.scheme_code == scheme_code).first()
-        if cached and cached.last_refreshed:
-            if datetime.utcnow() - cached.last_refreshed < timedelta(hours=CACHE_HOURS):
-                # Still update current_units from existing data
-                _update_net_units(db, user_id, scheme_code, purchase_types, redemption_types)
-                continue
+    if stale:
+        # Fetch all stale NAVs in parallel with a hard overall timeout — far
+        # faster than the previous serial loop.
+        async def _one(sc: str):
+            try:
+                return sc, await asyncio.wait_for(get_latest_nav(sc), timeout=8.0)
+            except Exception as e:
+                logger.warning(f"NAV refresh failed for {sc}: {e}")
+                return sc, None
 
-        # Fetch NAV
         try:
-            nav = await get_latest_nav(scheme_code)
-            if nav is not None:
-                if cached:
-                    cached.current_nav = nav
-                    cached.last_refreshed = datetime.utcnow()
-                else:
-                    db.add(NavCache(scheme_code=scheme_code, current_nav=nav, last_refreshed=datetime.utcnow()))
-                db.flush()
-        except Exception as e:
-            logger.error(f"NAV refresh failed for {scheme_code}: {e}")
+            results = await asyncio.wait_for(
+                asyncio.gather(*[_one(sc) for sc in stale]),
+                timeout=max(15.0, len(stale) * 5.0),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("NAV refresh overall timeout — continuing with what we have")
+            results = []
 
-        _update_net_units(db, user_id, scheme_code, purchase_types, redemption_types)
-
-    db.commit()
-
-
-def _update_net_units(db: Session, user_id: str, scheme_code: str, purchase_types: set, redemption_types: set):
-    """Calculate net units for a scheme and update all rows."""
-    purchased = db.query(func.coalesce(func.sum(Portfolio.units), 0)).filter(
-        Portfolio.user_id == user_id,
-        Portfolio.scheme_code == scheme_code,
-        Portfolio.transaction_type.in_(purchase_types),
-    ).scalar()
-
-    redeemed = db.query(func.coalesce(func.sum(Portfolio.units), 0)).filter(
-        Portfolio.user_id == user_id,
-        Portfolio.scheme_code == scheme_code,
-        Portfolio.transaction_type.in_(redemption_types),
-    ).scalar()
-
-    net = max(float(purchased) - float(redeemed), 0)
-
-    db.query(Portfolio).filter(
-        Portfolio.user_id == user_id,
-        Portfolio.scheme_code == scheme_code,
-    ).update({"current_units": net}, synchronize_session="fetch")
+        for sc, nav in results:
+            if nav is None:
+                continue
+            cached = cached_map.get(sc)
+            if cached:
+                cached.current_nav = nav
+                cached.last_refreshed = now
+            else:
+                db.add(NavCache(scheme_code=sc, current_nav=nav, last_refreshed=now))
+        db.commit()

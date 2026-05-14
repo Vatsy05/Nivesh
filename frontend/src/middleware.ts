@@ -16,7 +16,7 @@ export default auth((req) => {
   // Redirect authenticated users away from auth pages
   if (pathname.startsWith("/auth/")) {
     if (req.auth) {
-      return NextResponse.redirect(new URL("/dashboard", req.nextUrl.origin));
+      return NextResponse.redirect(new URL("/dashboard/upload", req.nextUrl.origin));
     }
   }
 

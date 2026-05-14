@@ -86,15 +86,38 @@ SKIP_PATTERNS = [
     re.compile(r"^\*\*\*", re.IGNORECASE),          # ***Address Updated...
     re.compile(r"^\*\*\*NCT", re.IGNORECASE),
     re.compile(r"^Opening Unit Balance", re.IGNORECASE),
-    re.compile(r"^Closing Unit Balance", re.IGNORECASE),
     re.compile(r"^NAV on", re.IGNORECASE),
-    re.compile(r"^Market Value on", re.IGNORECASE),
     re.compile(r"^Total Cost Value", re.IGNORECASE),
     re.compile(r"^Page \d+ of \d+", re.IGNORECASE),
     re.compile(r"^CAMSCASWS", re.IGNORECASE),
     re.compile(r"^Consolidated Account Statement", re.IGNORECASE),
     re.compile(r"^\d{2}-[A-Za-z]{3}-\d{4} To \d{2}-[A-Za-z]{3}-\d{4}$"),  # date range header
 ]
+
+# Closing balance patterns — extract these instead of skipping
+CLOSING_BALANCE_RE = re.compile(
+    r"^Closing\s+Unit\s+Balance\s*:?\s*([\d,]+\.\d+)",
+    re.IGNORECASE,
+)
+OPENING_BALANCE_RE = re.compile(
+    r"Opening\s+Unit\s+Balance\s*:?\s*([\d,]+\.\d+)",
+    re.IGNORECASE,
+)
+# Statement period header, e.g. "01-Apr-2024 To 31-Mar-2025"
+STATEMENT_RANGE_RE = re.compile(
+    r"^(\d{2}-[A-Za-z]{3}-\d{4})\s+To\s+(\d{2}-[A-Za-z]{3}-\d{4})$"
+)
+MARKET_VALUE_RE = re.compile(
+    # Match "Market Value [on <any-date>]: [Rs./₹/INR] <amount>"
+    # The date can contain alphabetic months ("31-Mar-2025"), so we use a
+    # permissive non-greedy gap rather than a strict date character class.
+    r"^Market\s+Value\b.*?([\d,]+\.\d+)\s*$",
+    re.IGNORECASE,
+)
+NAV_DATE_RE = re.compile(
+    r"^NAV\s+on\s+(\d{1,2}[/-][A-Za-z]{3}[/-]\d{4}|\d{2}[/-]\d{2}[/-]\d{4})\s*:?\s*(?:Rs\.?|₹|INR)?\s*([\d,]+\.\d+)",
+    re.IGNORECASE,
+)
 
 STAMP_DUTY_RE = re.compile(r"stamp duty", re.IGNORECASE)
 STT_RE = re.compile(r"STT Paid", re.IGNORECASE)
@@ -133,15 +156,22 @@ def _parse_date(s: str) -> Optional[date]:
 
 
 def _parse_amount(s: str) -> Optional[float]:
+    """
+    Parse a monetary amount string. Always returns a POSITIVE float.
+    Sign semantics are encoded in transaction_type, not the amount field.
+    Bracketed amounts like (5,000.00) indicate redemptions in CAMS statements,
+    but we store the absolute value — the caller uses transaction_type for sign.
+    """
     if not s:
         return None
     s = s.strip()
-    neg = s.startswith("(") and s.endswith(")")
+    # Track bracket notation (used for redemptions in CAMS)
+    _is_negative = s.startswith("(") and s.endswith(")")
     s = s.strip("()")
-    s = s.replace(",", "").replace("₹", "").replace("INR", "").strip()
+    s = s.replace(",", "").replace("\u20b9", "").replace("INR", "").strip()
     try:
-        val = float(s)
-        return -val if neg else val
+        val = abs(float(s))   # Always positive — sign comes from transaction_type
+        return val if val > 0 else None
     except ValueError:
         return None
 
@@ -223,16 +253,33 @@ def _parse_blocks(lines: List[str], fund_name: str, folio: str, holder: str) -> 
         # Peek next lines
         block = [txn_date_str]
         j = i + 1
+        abandoned = False
         while j < n and len(block) < 8:
             nl = lines[j].strip()
             if not nl:
                 j += 1
                 continue
+            # If we hit a skip-pattern line (***Address Updated***, ***NCT***,
+            # *** Stamp Duty ***, page headers, etc.) BEFORE the block has
+            # accumulated enough lines to be a real transaction, the current
+            # date is NOT a real transaction date — it belongs to a non-txn
+            # event. Abandon the block and continue past the skip line.
+            # Once the block is large enough (>=4 items) to be a valid txn,
+            # a skip-line is just a normal terminator (page break, footer).
+            if _is_skip_line(nl):
+                if len(block) < 4:
+                    abandoned = True
+                    j += 1
+                break
             # If we hit another date, stop
             if _is_date(nl) and len(block) > 2:
                 break
             block.append(nl)
             j += 1
+
+        if abandoned:
+            i = j
+            continue
 
         # skip short blocks (stamp duty / STT: date + tiny amount + description)
         if len(block) < 4:
@@ -258,9 +305,11 @@ def _parse_blocks(lines: List[str], fund_name: str, folio: str, holder: str) -> 
             continue
 
         # numbers order: amount, nav, units (, unit_balance optionally)
-        amount = _parse_amount(numbers[0])
+        raw_amount_str = numbers[0]
+        _is_bracketed = raw_amount_str.strip().startswith("(")
+        amount = _parse_amount(raw_amount_str)   # always positive now
         nav = _parse_amount(numbers[1])
-        units = _parse_amount(numbers[2])
+        units = _parse_amount(numbers[2])         # always positive
         description = " ".join(desc_parts).strip()
 
         # Skip stamp duty / STT lines (very small amounts, specific keywords)
@@ -273,6 +322,13 @@ def _parse_blocks(lines: List[str], fund_name: str, folio: str, holder: str) -> 
             i = j
             continue
 
+        # Infer transaction type from description; use bracket notation as fallback
+        txn_type = _classify_type(description)
+        # If the amount was bracketed AND no explicit redemption keyword was found,
+        # treat it as a redemption (CAMS bracket convention)
+        if _is_bracketed and txn_type not in ("redemption", "switch_out", "dividend", "dividend_reinvest"):
+            txn_type = "redemption"
+
         key = f"{parsed_date}_{amount}_{units}"
         if key in seen:
             i = j
@@ -281,9 +337,9 @@ def _parse_blocks(lines: List[str], fund_name: str, folio: str, holder: str) -> 
 
         transactions.append({
             "transaction_date": parsed_date,
-            "transaction_type": _classify_type(description),
-            "amount_inr": amount,
-            "units": units,
+            "transaction_type": txn_type,
+            "amount_inr": amount,      # always stored as positive absolute value
+            "units": units,            # always positive
             "nav_at_transaction": nav,
             "fund_name": fund_name or "Unknown Fund",
             "folio_number": folio,
@@ -304,6 +360,8 @@ def _parse_text(text: str, parser_name: str) -> Dict[str, Any]:
         "amc_names": [],
         "account_holder_name": "",
         "scheme_name_map": {},   # fund_name -> full scheme string from PDF
+        "statement_start": None, # date the statement period begins
+        "statement_end":   None,
         "parser_used": parser_name,
         "errors": [],
     }
@@ -323,6 +381,14 @@ def _parse_text(text: str, parser_name: str) -> Dict[str, Any]:
         m = re.match(r'^([A-Z][a-z]+(?:\s+[A-Z][a-zA-Z]+){1,4})$', s)
         if m and 5 < len(m.group(1)) < 60:
             result["account_holder_name"] = m.group(1).strip()
+            break
+
+    # Extract statement period start/end ("01-Apr-2024 To 31-Mar-2025")
+    for line in lines[:40]:
+        sr = STATEMENT_RANGE_RE.match(line.strip())
+        if sr:
+            result["statement_start"] = _parse_date(sr.group(1))
+            result["statement_end"]   = _parse_date(sr.group(2))
             break
 
     # ── Build sections ────────────────────────────────────────────────────────
@@ -387,6 +453,7 @@ def _parse_text(text: str, parser_name: str) -> Dict[str, Any]:
     # ── Extract transactions from each section ───────────────────────────────
     all_txns: List[Dict] = []
     scheme_name_map: Dict[str, str] = {}
+    closing_balances: Dict[str, Dict] = {}   # fund_name -> {units, market_value, nav}
 
     for fund, folio, scheme, sec_lines in sections:
         txns = _parse_blocks(sec_lines, fund, folio, result["account_holder_name"])
@@ -394,10 +461,68 @@ def _parse_text(text: str, parser_name: str) -> Dict[str, Any]:
         if scheme and fund not in scheme_name_map:
             scheme_name_map[fund] = scheme
 
+        # ── Extract Closing Unit Balance, Opening Unit Balance, Market Value
+        for line in sec_lines:
+            s = line.strip()
+            cb_match = CLOSING_BALANCE_RE.match(s)
+            if cb_match:
+                units_str = cb_match.group(1).replace(",", "")
+                try:
+                    closing_units = float(units_str)
+                    if fund not in closing_balances:
+                        closing_balances[fund] = {}
+                    closing_balances[fund]["closing_units"] = closing_units
+                    logger.debug(f"Closing units for '{fund}': {closing_units}")
+                except ValueError:
+                    pass
+
+            # Opening Unit Balance — units the user already held BEFORE this
+            # statement period. Without this, XIRR treats redemptions during
+            # the period as pure gain on the in-window SIPs, blowing the
+            # return to >100x. We capture it here and the upload route will
+            # turn it into a synthetic purchase at the statement start.
+            ob_match = OPENING_BALANCE_RE.search(s)
+            if ob_match:
+                units_str = ob_match.group(1).replace(",", "")
+                try:
+                    opening_units = float(units_str)
+                    if fund not in closing_balances:
+                        closing_balances[fund] = {}
+                    # Only set if not already set (use first/earliest occurrence)
+                    if "opening_units" not in closing_balances[fund]:
+                        closing_balances[fund]["opening_units"] = opening_units
+                        logger.debug(f"Opening units for '{fund}': {opening_units}")
+                except ValueError:
+                    pass
+
+            mv_match = MARKET_VALUE_RE.match(s)
+            if mv_match:
+                mv_str = mv_match.group(1).replace(",", "")
+                try:
+                    market_value = float(mv_str)
+                    if fund not in closing_balances:
+                        closing_balances[fund] = {}
+                    closing_balances[fund]["market_value"] = market_value
+                    logger.debug(f"Market value for '{fund}': {market_value}")
+                except ValueError:
+                    pass
+
+            nav_match = NAV_DATE_RE.match(s)
+            if nav_match:
+                nav_str = nav_match.group(2).replace(",", "")
+                try:
+                    nav_val = float(nav_str)
+                    if fund not in closing_balances:
+                        closing_balances[fund] = {}
+                    closing_balances[fund]["closing_nav"] = nav_val
+                except ValueError:
+                    pass
+
     result["transactions"] = all_txns
     result["fund_names"] = list(fund_names)
     result["amc_names"] = list(amc_names)
     result["scheme_name_map"] = scheme_name_map
+    result["closing_balances"] = closing_balances   # NEW: actual holdings
 
     logger.info(
         f"[{parser_name}] Parsed {len(all_txns)} transactions across "

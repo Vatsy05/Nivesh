@@ -3,12 +3,13 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { signOut } from "next-auth/react";
-import { Upload, BarChart3, LogOut, TrendingUp, LayoutDashboard } from "lucide-react";
+import { Upload, BarChart3, LogOut, TrendingUp, Wallet, Activity } from "lucide-react";
 
 const navItems = [
-  { path: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { path: "/dashboard/upload", label: "Upload", icon: Upload },
-  { path: "/dashboard/portfolio", label: "Portfolio", icon: BarChart3 },
+  { path: "/dashboard",           label: "Portfolio",  icon: Wallet },
+  { path: "/dashboard/upload",    label: "Upload",     icon: Upload },
+  { path: "/dashboard/portfolio", label: "Transactions", icon: BarChart3 },
+  { path: "/dashboard/analytics", label: "Analytics",  icon: TrendingUp },
 ];
 
 export default function Navbar() {

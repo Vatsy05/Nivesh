@@ -52,7 +52,7 @@ export default function RegisterPage() {
         setError("Account created but login failed. Please sign in.");
         router.push("/auth/login");
       } else {
-        router.push("/dashboard");
+        router.push("/dashboard/upload");
         router.refresh();
       }
     } catch {

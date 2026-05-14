@@ -68,3 +68,13 @@ class NavCache(Base):
     scheme_code = Column(Text, primary_key=True)
     current_nav = Column(Numeric(10, 4), nullable=True)
     last_refreshed = Column(DateTime, nullable=True)
+
+
+class HistoricalNavCache(Base):
+    """Per-date historical NAV for rolling return computation (Module 2)."""
+    __tablename__ = "historical_nav_cache"
+
+    scheme_code = Column(Text, primary_key=True, nullable=False)
+    nav_date = Column(Date, primary_key=True, nullable=False)
+    nav_value = Column(Numeric(10, 4), nullable=False)
+    last_fetched = Column(DateTime, default=datetime.utcnow)
