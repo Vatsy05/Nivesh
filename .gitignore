@@ -30,3 +30,4 @@ uploads/
 # Debug Output
 backend/debug_output/
 .env.example
+.env.example
